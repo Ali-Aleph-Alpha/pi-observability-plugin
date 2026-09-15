@@ -21,7 +21,13 @@ Langfuse as its own trace:
 - **Model generations**: every model request with inputs, outputs, cost, time to
   first token, and token usage including cache-read and reasoning splits.
 - **Conversation history**: each generation has all messages of that call.
-- **Reasoning**: each thinking block is on the step that made it.
+- **Reasoning**: each thinking block is on the step that made it — in the
+  history input and in the generation output, where Langfuse renders it as a
+  collapsible reasoning block next to the answer. Time to first token counts
+  thinking tokens, which reasoning models stream before any text.
+- **Available tools**: each generation records the tool definitions the model
+  was called with (name, description, parameter schema) as
+  `available_tools` metadata; the turn root lists the active tool names.
 - **Tool calls**: each tool Pi invokes, with input, output, and an `ERROR` level
   when the call fails.
 - **Images**: images you add to a prompt are uploaded as Langfuse media and

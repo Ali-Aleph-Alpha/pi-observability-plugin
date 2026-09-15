@@ -117,6 +117,9 @@ export function startMockProvider(): Promise<MockProvider> {
       const stage = messages.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length;
       const lastUser = messages[lastUserIdx];
       const failMode = JSON.stringify(lastUser?.content ?? "").includes("[fail]");
+      // "[inline-think]" models servers that stream reasoning as <think> tags
+      // inside the text content instead of a structured reasoning field.
+      const inlineThinkMode = JSON.stringify(lastUser?.content ?? "").includes("[inline-think]");
       // True only when a test loads the subagent fixture. The default script
       // does not change for the other tests.
       const canDelegate = (payload.tools ?? []).some((t) => t.function?.name === "subagent");
@@ -143,7 +146,13 @@ export function startMockProvider(): Promise<MockProvider> {
         return;
       }
 
-      if (canDelegate && stage === 0) {
+      if (inlineThinkMode) {
+        streamChunks(res, model, {
+          text: `<think>${FINAL_ANSWER_THINKING}</think>\nThis is the test workspace. Done.`,
+          finish: "stop",
+          usage: usage(800, 60, 0, 30),
+        });
+      } else if (canDelegate && stage === 0) {
         streamChunks(res, model, {
           text: "Delegating to a subagent. ",
           tool: { name: "subagent", args: { task: "inspect the repository" } },

@@ -329,13 +329,94 @@ export function extractThinking(content: unknown): ChatMlThinkingPart[] {
     const part = raw as { type?: unknown; thinking?: unknown; redacted?: unknown };
     if (part.type !== "thinking") continue;
     if (typeof part.thinking !== "string" || !part.thinking.trim()) continue;
+    // Only `thinking` is traced. `thinkingSignature` is provider replay data
+    // (serialized reasoning_details / encrypted blobs) and must never leave
+    // the process.
     parts.push({
       type: "thinking",
-      content: markDataUris(part.thinking),
+      content: markDataUris(redactLangfuseKeys(part.thinking) as string),
       ...(part.redacted ? { redacted: true as const } : {}),
     });
   }
   return parts;
+}
+
+export interface TracedTool {
+  name: string;
+  description?: string;
+  parameters?: unknown;
+}
+
+// Some OpenAI-compatible servers (vLLM default, DeepSeek distill, and
+// others behind proxies) stream reasoning inline as <think> tags in the
+// text content instead of a structured reasoning field. pi keeps that text
+// as-is, so the plugin splits it out — otherwise the reasoning never becomes a
+// Langfuse thinking block.
+const THINK_TAG_PATTERN = /<think>([\s\S]*?)(?:<\/think>|$)/g;
+
+export function splitInlineThinking(text: string): { text: string; thinking: ChatMlThinkingPart[] } {
+  if (!text.includes("<think>")) return { text, thinking: [] };
+  const rawParts: Array<{ type: "thinking"; thinking: string }> = [];
+  // An unclosed tag means the stream stopped mid-reasoning; the rest of the
+  // text is still reasoning, not answer.
+  const rest = text.replace(THINK_TAG_PATTERN, (_match, inner: string) => {
+    if (inner.trim()) rawParts.push({ type: "thinking", thinking: inner.trim() });
+    return "";
+  });
+  return { text: rest.trim(), thinking: extractThinking(rawParts) };
+}
+
+/**
+ * Structured thinking blocks win; inline <think> tags are only split when the
+ * provider sent no reasoning field, so a model that emits both is not traced
+ * twice.
+ */
+export function extractAnswerAndThinking(content: unknown): { text: string; thinking: ChatMlThinkingPart[] } {
+  const text = extractText(content);
+  const thinking = extractThinking(content);
+  if (thinking.length > 0) return { text, thinking };
+  return splitInlineThinking(text);
+}
+
+/**
+ * The tool definitions the model is called with, in pi's canonical form
+ * (name, description, JSON-schema parameters). Read structurally so older pi
+ * versions without getAllTools simply trace nothing instead of failing.
+ */
+export function readAvailableTools(ctx: {
+  getActiveTools?: () => string[];
+  getAllTools?: () => unknown;
+}): TracedTool[] | undefined {
+  let all: unknown;
+  let activeNames: unknown;
+  try {
+    all = ctx.getAllTools?.();
+    activeNames = ctx.getActiveTools?.();
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(all) || all.length === 0) return undefined;
+  const active = new Set(
+    Array.isArray(activeNames)
+      ? activeNames.filter((n): n is string => typeof n === "string")
+      : [],
+  );
+  const tools: TracedTool[] = [];
+  for (const raw of all) {
+    if (!raw || typeof raw !== "object") continue;
+    const tool = raw as { name?: unknown; description?: unknown; parameters?: unknown };
+    if (typeof tool.name !== "string" || !tool.name) continue;
+    if (active.size > 0 && !active.has(tool.name)) continue;
+    tools.push({
+      name: tool.name,
+      ...(typeof tool.description === "string" && tool.description
+        ? { description: tool.description }
+        : {}),
+      ...(tool.parameters ? { parameters: tool.parameters } : {}),
+    });
+  }
+  if (!tools.length) return undefined;
+  return redactLangfuseKeys(tools) as TracedTool[];
 }
 
 export function toChatMlMessage(message: unknown): ChatMlMessage | undefined {
@@ -351,8 +432,8 @@ export function toChatMlMessage(message: unknown): ChatMlMessage | undefined {
     return { role: "user", content: markDataUris(renderHistoryContent(msg.content)) };
   }
   if (msg.role === "assistant") {
-    const content = markDataUris(extractText(msg.content));
-    const thinking = extractThinking(msg.content);
+    const { text, thinking } = extractAnswerAndThinking(msg.content);
+    const content = markDataUris(text);
     const toolCalls = historyToolCalls(msg.content);
     if (!content && !thinking.length && !toolCalls.length) return undefined;
     return {
@@ -708,6 +789,13 @@ export default function (pi: ExtensionAPI) {
       ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
     };
 
+    let activeToolNames: string[] = [];
+    try {
+      activeToolNames = pi.getActiveTools();
+    } catch {
+      activeToolNames = [];
+    }
+
     const root = startObservation(
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
       {
@@ -720,6 +808,7 @@ export default function (pi: ExtensionAPI) {
           turn_number: turnNumber,
           cwd: ctx.cwd,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
+          ...(activeToolNames.length ? { active_tools: activeToolNames } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
           ...(isSubagent
             ? { pi_subagent: true, subagent_depth: inheritedParent!.depth, parent_session_id: inheritedParent!.sessionId }
@@ -768,6 +857,7 @@ export default function (pi: ExtensionAPI) {
     }
     const index = ++state.generationCount;
     const history = lastContextHistory;
+    const availableTools = readAvailableTools(pi);
     const baseInput: unknown =
       history ??
       (index === 1
@@ -791,6 +881,7 @@ export default function (pi: ExtensionAPI) {
           assistant_index: index - 1,
           input_source: history ? "context" : "delta",
           ...(history ? { history_message_count: history.length } : {}),
+          ...(availableTools ? { available_tools: availableTools } : {}),
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
         },
       },
@@ -802,7 +893,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_update", (event) => {
     const gen = state?.openGeneration;
     if (!gen || gen.finished || gen.sawFirstToken) return;
-    if (extractText((event.message as { content?: unknown })?.content).length > 0) {
+    // Reasoning models stream thinking before any text; the first thinking
+    // token is the real time-to-first-token.
+    const content = (event.message as { content?: unknown })?.content;
+    if (extractText(content).length > 0 || extractThinking(content).length > 0) {
       gen.sawFirstToken = true;
       gen.obs.update({ completionStartTime: new Date() });
     }
@@ -826,7 +920,7 @@ export default function (pi: ExtensionAPI) {
     const gen = state.openGeneration;
     if (!gen || gen.finished) return;
 
-    const text = extractText(message.content);
+    const { text, thinking } = extractAnswerAndThinking(message.content);
     const tools = extractToolCalls(message.content);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     if (message.stopReason === "error") state.sawError = true;
@@ -835,6 +929,9 @@ export default function (pi: ExtensionAPI) {
       output: {
         role: "assistant",
         ...(text ? { content: text } : {}),
+        // Langfuse renders `thinking` parts as collapsible reasoning blocks
+        // next to the assistant content (same ChatML shape as the history).
+        ...(thinking.length ? { thinking } : {}),
         ...(tools.length ? { tool_calls: tools } : {}),
       },
       model: message.responseModel || message.model,

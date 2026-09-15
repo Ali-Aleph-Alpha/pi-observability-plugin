@@ -14,6 +14,9 @@ import {
   buildHistoryInput,
   markDataUris,
   extractThinking,
+  splitInlineThinking,
+  extractAnswerAndThinking,
+  readAvailableTools,
   toChatMlMessage,
   type ChatMlMessage,
   type PiUsage,
@@ -680,5 +683,104 @@ describe("extractThinking", () => {
   it("keeps a long reasoning block whole", () => {
     const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(120_000) }]);
     assert.equal(parts[0]!.content.length, 120_000);
+  });
+
+  it("redacts Langfuse keys the model quoted into its reasoning", () => {
+    const parts = extractThinking([
+      { type: "thinking", thinking: "the .env holds sk-lf-abc123, I must not leak it" },
+    ]);
+    assert.deepEqual(parts, [
+      { type: "thinking", content: "the .env holds [redacted-langfuse-secret], I must not leak it" },
+    ]);
+  });
+});
+
+describe("splitInlineThinking", () => {
+  it("splits a <think> block out of the answer text", () => {
+    assert.deepEqual(splitInlineThinking("<think>hm, files</think>\nThe answer."), {
+      text: "The answer.",
+      thinking: [{ type: "thinking", content: "hm, files" }],
+    });
+  });
+
+  it("treats an unclosed tag as reasoning until the end", () => {
+    const result = splitInlineThinking("<think>still thinking");
+    assert.equal(result.text, "");
+    assert.deepEqual(result.thinking, [{ type: "thinking", content: "still thinking" }]);
+  });
+
+  it("keeps text without tags untouched", () => {
+    assert.deepEqual(splitInlineThinking("plain answer"), { text: "plain answer", thinking: [] });
+  });
+
+  it("collects multiple blocks in order and redacts secrets", () => {
+    const result = splitInlineThinking("<think>first</think>mid<think>key sk-lf-x9</think>");
+    assert.equal(result.text, "mid");
+    assert.deepEqual(result.thinking, [
+      { type: "thinking", content: "first" },
+      { type: "thinking", content: "key [redacted-langfuse-secret]" },
+    ]);
+  });
+});
+
+describe("extractAnswerAndThinking", () => {
+  it("prefers structured thinking blocks over inline tags", () => {
+    const result = extractAnswerAndThinking([
+      { type: "thinking", thinking: "structured" },
+      { type: "text", text: "<think>inline</think>answer" },
+    ]);
+    assert.equal(result.text, "<think>inline</think>answer");
+    assert.deepEqual(result.thinking, [{ type: "thinking", content: "structured" }]);
+  });
+
+  it("falls back to inline tags when no structured block exists", () => {
+    const result = extractAnswerAndThinking([{ type: "text", text: "<think>inline</think>answer" }]);
+    assert.equal(result.text, "answer");
+    assert.deepEqual(result.thinking, [{ type: "thinking", content: "inline" }]);
+  });
+});
+
+describe("readAvailableTools", () => {
+  const tools = [
+    { name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } } },
+    { name: "bash", description: "Run a command", parameters: { type: "object", properties: { command: { type: "string" } } } },
+    { name: "edit", description: "Edit a file", parameters: { type: "object" } },
+  ];
+
+  it("returns only the active tools with description and schema", () => {
+    const result = readAvailableTools({
+      getActiveTools: () => ["read", "bash"],
+      getAllTools: () => tools,
+    });
+    assert.deepEqual(result?.map((t) => t.name), ["read", "bash"]);
+    assert.equal(result?.[0]?.description, "Read a file");
+    assert.deepEqual(result?.[0]?.parameters, { type: "object", properties: { path: { type: "string" } } });
+  });
+
+  it("falls back to all tools when no active list is available", () => {
+    const result = readAvailableTools({ getAllTools: () => tools });
+    assert.equal(result?.length, 3);
+  });
+
+  it("returns undefined for older pi versions without tool accessors", () => {
+    assert.equal(readAvailableTools({}), undefined);
+  });
+
+  it("returns undefined when the accessors throw", () => {
+    assert.equal(
+      readAvailableTools({
+        getAllTools: () => {
+          throw new Error("no session");
+        },
+      }),
+      undefined,
+    );
+  });
+
+  it("skips malformed entries and redacts secrets in schemas", () => {
+    const result = readAvailableTools({
+      getAllTools: () => [null, 42, { description: "no name" }, { name: "leaky", description: "uses sk-lf-abc123" }],
+    });
+    assert.deepEqual(result, [{ name: "leaky", description: "uses [redacted-langfuse-secret]" }]);
   });
 });

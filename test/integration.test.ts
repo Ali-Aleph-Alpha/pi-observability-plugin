@@ -697,6 +697,33 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         "reasoning must not be mixed into the message content",
       );
 
+      // The generation output itself carries the reasoning, not just the history.
+      const finalGen = secondTurn.at(-1)!;
+      const output = JSON.parse(String(finalGen.attrs["langfuse.observation.output"])) as {
+        role: string;
+        content?: string;
+        thinking?: Array<{ type: string; content: string }>;
+      };
+      assert.equal(output.role, "assistant");
+      assert.equal(output.content, "This is the test workspace. Done.");
+      assert.deepEqual(output.thinking, [{ type: "thinking", content: FINAL_ANSWER_THINKING }]);
+
+      // Every generation records the tools the model was called with.
+      const tracedTools = JSON.parse(
+        String(finalGen.attrs["langfuse.observation.metadata.available_tools"]),
+      ) as Array<{ name: string; description?: string; parameters?: unknown }>;
+      const toolNames = tracedTools.map((t) => t.name);
+      assert.ok(toolNames.includes("bash"), "bash must be traced as available");
+      assert.ok(toolNames.includes("read"), "read must be traced as available");
+      assert.ok(
+        tracedTools.every((t) => t.description && t.parameters),
+        "each tool carries the description and schema the model saw",
+      );
+      assert.ok(
+        JSON.stringify(roots[1]!.attrs).includes("active_tools"),
+        "the turn root lists the active tool names",
+      );
+
       const exported = JSON.stringify(capture.requests);
       assert.ok(!exported.includes("thinkingSignature"), "the signature blob must not be traced");
       assert.ok(!exported.includes("reasoning_content"), "the raw provider field must not be traced");
@@ -705,6 +732,29 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const withReasoning = sent.at(-1)!.filter((m) => m.reasoning_content);
       assert.equal(withReasoning.length, 1);
       assert.equal(withReasoning[0]!.reasoning_content, FINAL_ANSWER_THINKING);
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("splits inline <think> tags into a reasoning block on the generation output", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const env = buildLangfuseEnv(capture);
+      assert.equal((await runPi(sandbox, "[inline-think] Summarize this", { env })).status, 0);
+      await waitForRequests(capture, 1);
+
+      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      assert.ok(generations.length > 0);
+      const output = JSON.parse(String(generations.at(-1)!.attrs["langfuse.observation.output"])) as {
+        role: string;
+        content?: string;
+        thinking?: Array<{ type: string; content: string }>;
+      };
+      assert.equal(output.role, "assistant");
+      assert.equal(output.content, "This is the test workspace. Done.");
+      assert.deepEqual(output.thinking, [{ type: "thinking", content: FINAL_ANSWER_THINKING }]);
     } finally {
       capture.close();
     }
